@@ -1,0 +1,22 @@
+[project]
+name = "ezconfig"
+version = "0.1.0"
+description = "A TUI config editor with on-screen switches, color pickers, dropdowns, and number inputs."
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.80",
+    "requests>=2.31",
+    "tomlkit>=0.13",
+    "ruamel.yaml>=0.18",
+    "jsonschema>=4.0",
+]
+
+[project.scripts]
+ezconfig = "ezconfig.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
