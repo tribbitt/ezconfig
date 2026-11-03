@@ -1,26 +1,43 @@
 [project]
 name = "ezconfig"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Edit config files in the terminal with switches, color pickers, option lists, and number inputs."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "tribbitt" }]
 requires-python = ">=3.11"
 dependencies = [
-    "textual>=0.86",
+    "textual>=1.0",
+    "rich>=13",
     "requests>=2.31",
     "tomlkit>=0.13",
     "ruamel.yaml>=0.18",
     "jsonschema>=4.18",
+    "referencing>=0.28",
+]
+keywords = ["config", "tui", "textual", "toml", "yaml", "json", "ini"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+[project.urls]
+Repository = "https://github.com/tribbitt/ezconfig"
+
 [project.scripts]
 ezconfig = "ezconfig.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "ezconfig.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
