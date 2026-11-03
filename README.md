@@ -4,10 +4,13 @@ Edit config files in the terminal. Each key gets a switch, color picker, option 
 
 ## Install
 
+Requires Python 3.11 or later.
+
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -e .
+pipx install git+https://github.com/tribbitt/ezconfig
 ```
+
+With uv: `uv tool install git+https://github.com/tribbitt/ezconfig`. To update, run `pipx upgrade ezconfig` or `uv tool upgrade ezconfig`.
 
 ## Use
 
@@ -66,6 +69,13 @@ TOML, YAML, JSON, and INI keep comments and layout. Other files use the text for
 ## Test
 
 ```sh
+git clone https://github.com/tribbitt/ezconfig
+cd ezconfig
+python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
+
+## License
+
+MIT
