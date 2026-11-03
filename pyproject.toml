@@ -1,15 +1,19 @@
 [project]
 name = "ezconfig"
-version = "0.1.0"
-description = "A TUI config editor with on-screen switches, color pickers, dropdowns, and number inputs."
+version = "0.2.0"
+description = "Edit config files in the terminal with switches, color pickers, option lists, and number inputs."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "textual>=0.80",
+    "textual>=0.86",
     "requests>=2.31",
     "tomlkit>=0.13",
     "ruamel.yaml>=0.18",
-    "jsonschema>=4.0",
+    "jsonschema>=4.18",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [project.scripts]
 ezconfig = "ezconfig.cli:main"
@@ -20,3 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

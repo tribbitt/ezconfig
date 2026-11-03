@@ -1,54 +1,55 @@
-"""Custom Textual widgets — hex color picker and list editor."""
+"""Editor widgets: color picker, option chooser, list editor."""
 from __future__ import annotations
 
 import colorsys
+import json
 import re
 from typing import Any
 
+from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Button, Input, Select, Static, Switch
-
-
-def _hsl_to_hex(hue: float, lightness: float, saturation: float = 1.0) -> str:
-    """hue in [0,360), lightness/saturation in [0,1]."""
-    r, g, b = colorsys.hls_to_rgb((hue % 360) / 360.0, lightness, saturation)
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
-
-
-# 24-step rainbow at 50% lightness, full saturation.
-_HUE_STRIP = [(h, _hsl_to_hex(h, 0.5)) for h in range(0, 360, 15)]
-# 11-step lightness ramp anchors (recomputed per-hue at runtime).
-_LIGHT_STEPS = [i / 10.0 for i in range(0, 11)]  # 0.0 .. 1.0 inclusive
+from textual.widgets import Button, Input, OptionList, Select, Static, Switch
+from textual.widgets.option_list import Option
 
 HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
 
-class HexColorPicker(Widget):
-    """Hex + RGB color picker with live swatch preview and a preset palette.
+def _hsl_to_hex(hue: float, lightness: float, saturation: float = 1.0) -> str:
+    r, g, b = colorsys.hls_to_rgb((hue % 360) / 360.0, lightness, saturation)
+    return f"#{round(r * 255):02x}{round(g * 255):02x}{round(b * 255):02x}"
 
-    The hex string is the single source of truth; the RGB inputs and the
-    preset buttons all read from / write to it. The widget emits its own
-    `HexColorPicker.Changed` message whenever the value resolves to a valid
-    hex color, so consumers don't need to handle the internal Input events.
-    """
+
+def _rgb(hex_value: str) -> tuple[int, int, int]:
+    if not HEX_RE.match(hex_value):
+        return (0, 0, 0)
+    v = hex_value[1:]
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    return int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
+
+
+_HUES = list(range(0, 360, 15))
+_LIGHTNESS = [i / 10 for i in range(11)]
+
+
+class ColorPicker(Widget):
+    """Hex input, RGB inputs, a hue strip and a lightness strip, all in sync.
+    Posts Changed with a #rrggbb value (alpha kept for #rrggbbaa input)."""
 
     DEFAULT_CSS = """
-    HexColorPicker { height: auto; }
-    HexColorPicker #hex-row { height: 3; layout: horizontal; }
-    HexColorPicker #hex-row Input { width: 1fr; }
-    HexColorPicker .swatch { width: 10; height: 3; border: solid white; margin-left: 1; }
-    HexColorPicker #rgb-row { height: 3; layout: horizontal; margin-top: 1; }
-    HexColorPicker #rgb-row .rgb-label { width: 3; content-align: center middle; }
-    HexColorPicker #rgb-row .rgb-input { width: 1fr; margin-right: 1; }
-    HexColorPicker .gradient-label { color: $text-muted; padding-top: 1; }
-    HexColorPicker #hues { height: 2; layout: horizontal; }
-    HexColorPicker .hue-cell { width: 1fr; min-width: 2; height: 2; }
-    HexColorPicker #lights { height: 2; layout: horizontal; }
-    HexColorPicker .light-cell { width: 1fr; min-width: 2; height: 2; }
+    ColorPicker { height: auto; }
+    ColorPicker .row { height: 3; }
+    ColorPicker #hex { width: 1fr; }
+    ColorPicker #swatch { width: 10; height: 3; border: solid $foreground; margin-left: 1; }
+    ColorPicker .rgb-label { width: 3; content-align: center middle; height: 3; }
+    ColorPicker .rgb { width: 1fr; margin-right: 1; }
+    ColorPicker .strip-label { color: $text-muted; padding-top: 1; }
+    ColorPicker .strip { height: 2; }
+    ColorPicker .cell { width: 1fr; min-width: 2; height: 2; border: none; }
     """
 
     class Changed(Message):
@@ -56,184 +57,194 @@ class HexColorPicker(Widget):
             self.value = value
             super().__init__()
 
-    value: reactive[str] = reactive("")
-
-    def __init__(self, value: str = "#000000", **kwargs):
+    def __init__(self, value: str = "#000000", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.value = value if HEX_RE.match(value) else "#000000"
         self._syncing = False
 
     def compose(self) -> ComposeResult:
-        r, g, b = self._to_rgb(self.value)
-        with Horizontal(id="hex-row"):
-            yield Input(value=self.value, placeholder="#rrggbb", id="hex-input")
-            yield Static("", classes="swatch", id="hex-swatch")
-        with Horizontal(id="rgb-row"):
-            yield Static("R", classes="rgb-label")
-            yield Input(value=str(r), type="integer", id="rgb-r", classes="rgb-input")
-            yield Static("G", classes="rgb-label")
-            yield Input(value=str(g), type="integer", id="rgb-g", classes="rgb-input")
-            yield Static("B", classes="rgb-label")
-            yield Input(value=str(b), type="integer", id="rgb-b", classes="rgb-input")
-        yield Static("hue", classes="gradient-label")
-        with Horizontal(id="hues"):
-            for hue, hex_color in _HUE_STRIP:
-                btn = Button(" ", id=f"hue-{hue}", classes="hue-cell")
-                btn.styles.background = hex_color
-                yield btn
-        yield Static("lightness", classes="gradient-label")
-        with Horizontal(id="lights"):
-            current_hue, _ = self._current_hsl()
-            for i, light in enumerate(_LIGHT_STEPS):
-                btn = Button(" ", id=f"light-{i}", classes="light-cell")
-                btn.styles.background = _hsl_to_hex(current_hue, light)
-                yield btn
+        r, g, b = _rgb(self.value)
+        with Horizontal(classes="row"):
+            yield Input(value=self.value, placeholder="#rrggbb", id="hex")
+            yield Static("", id="swatch")
+        with Horizontal(classes="row"):
+            for label, val in (("R", r), ("G", g), ("B", b)):
+                yield Static(label, classes="rgb-label")
+                yield Input(value=str(val), type="integer", id=f"rgb-{label.lower()}", classes="rgb")
+        yield Static("hue", classes="strip-label")
+        with Horizontal(classes="strip"):
+            for hue in _HUES:
+                cell = Button(" ", id=f"hue-{hue}", classes="cell")
+                cell.styles.background = _hsl_to_hex(hue, 0.5)
+                yield cell
+        yield Static("lightness", classes="strip-label")
+        with Horizontal(classes="strip", id="lightness"):
+            for i in range(len(_LIGHTNESS)):
+                yield Button(" ", id=f"light-{i}", classes="cell")
 
     def on_mount(self) -> None:
-        self._apply_swatch(self.value)
+        self._show(self.value)
 
-    def _current_hsl(self) -> tuple[float, float]:
-        """Derive (hue, lightness) from the current hex value. Saturation
-        ignored (always treated as full)."""
-        r, g, b = self._to_rgb(self.value)
-        h, l, _s = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
-        return h * 360.0, l
+    def _hue(self) -> float:
+        r, g, b = _rgb(self.value)
+        return colorsys.rgb_to_hls(r / 255, g / 255, b / 255)[0] * 360
 
-    def _refresh_lightness_strip(self) -> None:
-        """Repaint the lightness row to reflect the current hue."""
-        current_hue, _ = self._current_hsl()
-        for i, light in enumerate(_LIGHT_STEPS):
-            try:
-                btn = self.query_one(f"#light-{i}", Button)
-            except Exception:
-                return
-            btn.styles.background = _hsl_to_hex(current_hue, light)
-
-    @property
-    def is_valid(self) -> bool:
-        return bool(HEX_RE.match(self.value))
-
-    # --- Event handlers (internal; everything is event.stop()'d so the
-    # parent app only sees our own Changed message) -----------------------
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if self._syncing:
-            event.stop()
-            return
-        wid = event.input.id or ""
-        if wid == "hex-input":
-            self.value = event.value
-            self._apply_swatch(event.value)
-            if HEX_RE.match(event.value):
-                self._sync_rgb_inputs(event.value)
-                self._refresh_lightness_strip()
-                self.post_message(self.Changed(event.value))
-        elif wid in ("rgb-r", "rgb-g", "rgb-b"):
-            new_hex = self._hex_from_rgb_inputs()
-            if new_hex is None:
-                event.stop()
-                return
-            self.value = new_hex
-            self._apply_swatch(new_hex)
-            self._sync_hex_input(new_hex)
-            self._refresh_lightness_strip()
-            self.post_message(self.Changed(new_hex))
-        event.stop()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id or ""
-        color: str | None = None
-        if bid.startswith("hue-"):
-            try:
-                hue = int(bid[len("hue-"):])
-            except ValueError:
-                return
-            color = _hsl_to_hex(hue, 0.5)
-        elif bid.startswith("light-"):
-            try:
-                idx = int(bid[len("light-"):])
-            except ValueError:
-                return
-            current_hue, _ = self._current_hsl()
-            color = _hsl_to_hex(current_hue, _LIGHT_STEPS[idx])
-        else:
-            return
-        if color is None:
-            return
-        self.value = color
-        self._apply_swatch(color)
-        self._sync_hex_input(color)
-        self._sync_rgb_inputs(color)
-        # If the hue changed, repaint the lightness strip to the new hue ramp.
-        if bid.startswith("hue-"):
-            self._refresh_lightness_strip()
-        self.post_message(self.Changed(color))
-        event.stop()
-
-    # --- Internals --------------------------------------------------------
-
-    def _hex_from_rgb_inputs(self) -> str | None:
-        try:
-            r = int(self.query_one("#rgb-r", Input).value or "0")
-            g = int(self.query_one("#rgb-g", Input).value or "0")
-            b = int(self.query_one("#rgb-b", Input).value or "0")
-        except ValueError:
-            return None
-        r, g, b = max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))
-        return f"#{r:02x}{g:02x}{b:02x}"
-
-    def _sync_hex_input(self, value: str) -> None:
-        self._syncing = True
-        try:
-            self.query_one("#hex-input", Input).value = value
-        finally:
-            self._syncing = False
-
-    def _sync_rgb_inputs(self, value: str) -> None:
-        r, g, b = self._to_rgb(value)
-        self._syncing = True
-        try:
-            self.query_one("#rgb-r", Input).value = str(r)
-            self.query_one("#rgb-g", Input).value = str(g)
-            self.query_one("#rgb-b", Input).value = str(b)
-        finally:
-            self._syncing = False
-
-    @staticmethod
-    def _to_rgb(hex_value: str) -> tuple[int, int, int]:
-        if not HEX_RE.match(hex_value):
-            return (0, 0, 0)
-        v = hex_value.lstrip("#")
-        if len(v) == 3:
-            v = "".join(c * 2 for c in v)
-        if len(v) == 8:
-            v = v[:6]
-        return int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
-
-    def _apply_swatch(self, value: str) -> None:
-        swatch = self.query_one("#hex-swatch", Static)
+    def _show(self, value: str) -> None:
+        swatch = self.query_one("#swatch", Static)
         if HEX_RE.match(value):
-            v = value
-            if len(v) == 4:
-                v = "#" + "".join(c * 2 for c in v[1:])
-            swatch.styles.background = v[:7]
+            swatch.styles.background = "#" + "".join(f"{c:02x}" for c in _rgb(value))
             swatch.update("")
         else:
-            swatch.styles.background = "black"
             swatch.update("?")
+        hue = self._hue()
+        for i, light in enumerate(_LIGHTNESS):
+            self.query_one(f"#light-{i}", Button).styles.background = _hsl_to_hex(hue, light)
+
+    def _set(self, value: str, source: str) -> None:
+        alpha = self.value[7:9] if len(self.value) == 9 and source != "hex" else ""
+        self.value = value + alpha
+        self._syncing = True
+        try:
+            if source != "hex":
+                self.query_one("#hex", Input).value = self.value
+            if source != "rgb":
+                for name, val in zip("rgb", _rgb(self.value)):
+                    self.query_one(f"#rgb-{name}", Input).value = str(val)
+        finally:
+            self._syncing = False
+        self._show(self.value)
+        self.post_message(self.Changed(self.value))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        event.stop()
+        if self._syncing:
+            return
+        if event.input.id == "hex":
+            if HEX_RE.match(event.value):
+                self._set(event.value, "hex")
+            else:
+                self.query_one("#swatch", Static).update("?")
+            return
+        try:
+            r, g, b = (max(0, min(255, int(self.query_one(f"#rgb-{n}", Input).value or 0))) for n in "rgb")
+        except ValueError:
+            return
+        self._set(f"#{r:02x}{g:02x}{b:02x}", "rgb")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        bid = event.button.id or ""
+        if bid.startswith("hue-"):
+            self._set(_hsl_to_hex(int(bid[4:]), 0.5), "strip")
+        elif bid.startswith("light-"):
+            self._set(_hsl_to_hex(self._hue(), _LIGHTNESS[int(bid[6:])]), "strip")
+
+
+def option_label(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+class ChoiceEditor(Widget):
+    """Pick one of `options`: type to filter, Enter or click to choose.
+    When `strict` is False, Enter also accepts text that isn't an option."""
+
+    DEFAULT_CSS = """
+    ChoiceEditor { height: auto; }
+    ChoiceEditor OptionList { height: auto; max-height: 16; }
+    """
+    BINDINGS = [Binding("down", "focus_list", "Options", show=False)]
+
+    class Changed(Message):
+        def __init__(self, value: Any) -> None:
+            self.value = value
+            super().__init__()
+
+    def __init__(
+        self,
+        options: list[Any],
+        value: Any,
+        strict: bool = True,
+        notes: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.options = list(options)
+        self.notes = notes or []
+        self.strict = strict
+        self.value = value
+        self._initial = "" if value is None else option_label(value)
+
+    def compose(self) -> ComposeResult:
+        hint = "type to filter" if self.strict else "type to filter, or enter any value"
+        yield Input(value=self._initial, placeholder=hint, id="choice-input")
+        yield OptionList(id="choice-list")
+
+    def on_mount(self) -> None:
+        self._fill("")
+
+    def _fill(self, query: str) -> None:
+        olist = self.query_one(OptionList)
+        olist.clear_options()
+        q = query.lower()
+        current = None
+        for i, opt in enumerate(self.options):
+            label = option_label(opt)
+            note = self.notes[i] if i < len(self.notes) else ""
+            if q and q not in label.lower() and q not in note.lower():
+                continue
+            text = Text(label)
+            if note:
+                text.append("  " + note.splitlines()[0][:80], style="dim")
+            if opt == self.value and current is None:
+                current = olist.option_count
+            olist.add_option(Option(text, id=str(i)))
+        if current is not None:
+            olist.highlighted = current
+
+    def action_focus_list(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        event.stop()
+        self._fill("" if event.value == self._initial else event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        text = event.value
+        exact = [o for o in self.options if option_label(o) == text]
+        if exact:
+            self._choose(exact[0])
+            return
+        olist = self.query_one(OptionList)
+        if olist.option_count == 1:
+            self._choose(self.options[int(olist.get_option_at_index(0).id or 0)])
+        elif not self.strict and text:
+            self._choose(text)
+        else:
+            self.notify("Not one of the options.", severity="warning")
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._choose(self.options[int(event.option.id or 0)])
+
+    def _choose(self, value: Any) -> None:
+        self.value = value
+        self._initial = option_label(value)
+        self.query_one(Input).value = self._initial
+        self.post_message(self.Changed(value))
 
 
 class ListEditor(Widget):
-    """Edit a list of scalars. One row per item with a remove button, plus add."""
+    """Edit a list of scalars: one row per item, with remove and add buttons."""
 
     DEFAULT_CSS = """
     ListEditor { height: auto; }
     ListEditor #rows { height: auto; }
-    ListEditor .row { height: 3; layout: horizontal; margin-bottom: 0; }
+    ListEditor .row { height: 3; }
     ListEditor .row Input, ListEditor .row Select { width: 1fr; }
     ListEditor .row Switch { width: 10; }
     ListEditor .row Button { width: 5; margin-left: 1; }
-    ListEditor #add-row { width: 14; margin-top: 1; }
+    ListEditor #add { width: 14; margin-top: 1; }
     """
 
     class Changed(Message):
@@ -245,111 +256,86 @@ class ListEditor(Widget):
         self,
         items: list[Any] | None = None,
         item_type: str = "string",
-        item_enum: list[Any] | None = None,
-        **kwargs,
+        item_options: list[Any] | None = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.items: list[Any] = list(items) if items else []
-        self.item_type = item_type
-        self.item_enum = item_enum
+        self.items: list[Any] = list(items or [])
+        self.item_type = item_type or "string"
+        self.item_options = item_options
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Vertical(id="rows")
-            yield Button("+ Add item", id="add-row", variant="primary")
+        yield Vertical(id="rows")
+        yield Button("+ Add item", id="add", variant="primary")
 
-    def on_mount(self) -> None:
-        self._rebuild()
+    async def on_mount(self) -> None:
+        await self._rebuild()
 
-    def _empty_value(self) -> Any:
-        if self.item_enum:
-            return self.item_enum[0]
-        return {"string": "", "integer": 0, "number": 0.0, "boolean": False}.get(self.item_type, "")
-
-    def _rebuild(self) -> None:
+    async def _rebuild(self) -> None:
         rows = self.query_one("#rows", Vertical)
-        rows.remove_children()
+        await rows.remove_children()
         for idx, item in enumerate(self.items):
-            row = Horizontal(classes="row")
-            rows.mount(row)
-            row.mount(self._item_widget(idx, item))
-            row.mount(Button("x", id=f"rm-{idx}", variant="error"))
+            await rows.mount(Horizontal(self._item_widget(idx, item), Button("x", id=f"rm-{idx}", variant="error"), classes="row"))
 
     def _item_widget(self, idx: int, item: Any) -> Widget:
         wid = f"item-{idx}"
-        if self.item_enum:
-            options = [(str(o), o) for o in self.item_enum]
-            return Select(
-                options=options,
-                value=item if item in self.item_enum else Select.NULL,
-                id=wid,
-            )
+        if self.item_options:
+            options = [(option_label(o), o) for o in self.item_options]
+            return Select(options, value=item if item in self.item_options else Select.NULL, id=wid)
         if self.item_type == "boolean":
             return Switch(value=bool(item), id=wid)
         if self.item_type in ("integer", "number"):
-            return Input(value=str(item), type="number", id=wid)
+            return Input(value=str(item), type=self.item_type, id=wid)
         return Input(value="" if item is None else str(item), id=wid)
 
-    # --- Event handlers — keep events scoped to this widget ----------------
+    def _changed(self) -> None:
+        self.post_message(self.Changed(list(self.items)))
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
         bid = event.button.id or ""
-        if bid == "add-row":
-            self.items.append(self._empty_value())
-            self._rebuild()
-            self.post_message(self.Changed(list(self.items)))
-            event.stop()
+        if bid == "add":
+            empty = {"integer": 0, "number": 0.0, "boolean": False}.get(self.item_type, "")
+            self.items.append(self.item_options[0] if self.item_options else empty)
         elif bid.startswith("rm-"):
-            try:
-                idx = int(bid[3:])
-            except ValueError:
-                return
-            if 0 <= idx < len(self.items):
-                del self.items[idx]
-                self._rebuild()
-                self.post_message(self.Changed(list(self.items)))
-                event.stop()
+            del self.items[int(bid[3:])]
+        else:
+            return
+        await self._rebuild()
+        self._changed()
+
+    @staticmethod
+    def _index(widget_id: str | None) -> int | None:
+        if widget_id and widget_id.startswith("item-"):
+            return int(widget_id[5:])
+        return None
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        idx = self._idx_for(event.input.id)
+        event.stop()
+        idx = self._index(event.input.id)
         if idx is None:
             return
-        raw = event.value
-        if self.item_type == "integer":
-            try:
-                self.items[idx] = int(raw)
-            except ValueError:
-                return
-        elif self.item_type == "number":
-            try:
-                self.items[idx] = float(raw)
-            except ValueError:
-                return
-        else:
-            self.items[idx] = raw
-        self.post_message(self.Changed(list(self.items)))
-        event.stop()
+        try:
+            if self.item_type == "integer":
+                self.items[idx] = int(event.value)
+            elif self.item_type == "number":
+                self.items[idx] = float(event.value)
+            else:
+                self.items[idx] = event.value
+        except ValueError:
+            return
+        self._changed()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
-        idx = self._idx_for(event.switch.id)
-        if idx is None:
-            return
-        self.items[idx] = bool(event.value)
-        self.post_message(self.Changed(list(self.items)))
         event.stop()
+        idx = self._index(event.switch.id)
+        if idx is not None:
+            self.items[idx] = event.value
+            self._changed()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        idx = self._idx_for(event.select.id)
-        if idx is None or event.value is Select.NULL:
-            return
-        self.items[idx] = event.value
-        self.post_message(self.Changed(list(self.items)))
         event.stop()
-
-    def _idx_for(self, wid: str | None) -> int | None:
-        if not wid or not wid.startswith("item-"):
-            return None
-        try:
-            return int(wid[5:])
-        except ValueError:
-            return None
+        idx = self._index(event.select.id)
+        if idx is not None and event.value is not Select.NULL:
+            self.items[idx] = event.value
+            self._changed()

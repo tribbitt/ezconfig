@@ -1,520 +1,591 @@
-"""The Textual app: tree on the left, dynamic editor on the right."""
+"""The Textual app: key tree on the left, editor on the right."""
 from __future__ import annotations
 
+import difflib
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+from rich.syntax import Syntax
+from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Button, Footer, Header, Input, Label, Select, Static, Switch, Tree
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.suggester import SuggestFromList
+from textual.widgets import Button, Footer, Header, Input, Label, Static, Switch, Tree
 from textual.widgets.tree import TreeNode
 
-from ezconfig.formats import Document, Path_, load as load_doc
-from ezconfig.schema import FieldSpec, SchemaIndex, build_index
-from ezconfig.widgets import HexColorPicker, ListEditor
+from ezconfig import formats, schema as schema_mod
+from ezconfig.document import Document, KeyPath, is_container, items, parse_literal
+from ezconfig.index import Index, build
+from ezconfig.spec import COLOR_RE, FieldSpec, infer
+from ezconfig.widgets import ChoiceEditor, ColorPicker, ListEditor, option_label
+
+MAX_MATCHES = 500
 
 
-class EzConfigApp(App):
+class Node(NamedTuple):
+    kind: str  # section | key | unset-section | unset-key | add | more
+    path: KeyPath
+
+
+def dotted(path: KeyPath) -> str:
+    return ".".join(path) or "(top level)"
+
+
+def show_value(value: Any, limit: int = 40) -> str:
+    if isinstance(value, list):
+        return f"[{len(value)} items]"
+    if isinstance(value, dict):
+        return f"{{{len(value)} keys}}"
+    s = option_label(value)
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+class ReviewScreen(ModalScreen[None]):
+    """Unsaved changes as a diff, plus schema problems."""
+
+    BINDINGS = [Binding("escape,ctrl+o", "dismiss", "Close")]
+    DEFAULT_CSS = """
+    ReviewScreen { align: center middle; }
+    ReviewScreen > VerticalScroll { width: 90%; height: 90%; border: round $accent; background: $surface; padding: 0 1; }
+    ReviewScreen .title { text-style: bold; padding-top: 1; }
+    """
+
+    def __init__(self, diff: str, problems: list[str]):
+        super().__init__()
+        self.diff = diff
+        self.problems = problems
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Static("Changes", classes="title")
+            if self.diff:
+                yield Static(Syntax(self.diff, "diff", theme="ansi_dark", word_wrap=True))
+            else:
+                yield Static("No changes.")
+            yield Static("Schema check", classes="title")
+            yield Static("\n".join(self.problems) or "No problems found.", markup=False)
+            yield Static("Esc closes.", classes="title")
+
+
+class EzConfigApp(App[None]):
+    AUTO_FOCUS = "#tree"
     CSS = """
-    Screen { layout: vertical; }
-    #banner { height: auto; padding: 0 1; background: $warning; color: black; text-style: bold; display: none; }
+    #banner { height: auto; padding: 0 1; background: $warning; color: $background; display: none; }
     #banner.visible { display: block; }
     #main { height: 1fr; }
     #tree-pane { width: 40%; border-right: solid $accent; }
-    #editor-pane { width: 1fr; padding: 1 2; }
-    #status { dock: bottom; height: 1; padding: 0 1; background: $boost; color: $text; }
-    .field-label { text-style: bold; padding-top: 1; }
-    .field-desc { color: $text-muted; padding-bottom: 1; }
-    .field-meta { color: $text-muted; padding-top: 1; }
-    .field-warning { color: $warning; text-style: italic; padding-top: 1; }
-    .placeholder { color: $text-muted; padding: 2; }
-    Tree { padding: 1; }
+    #find { display: none; }
+    #find.visible { display: block; }
+    #tree { padding: 0 1; }
+    #editor { width: 1fr; padding: 1 2; }
+    #status { height: auto; max-height: 3; padding: 0 1; background: $boost; }
+    #status.error { color: $error; }
+    .path { text-style: bold; }
+    .muted { color: $text-muted; padding-top: 1; }
+    .warn { color: $warning; padding-top: 1; }
+    .desc { padding-bottom: 1; }
     """
 
     BINDINGS = [
         Binding("ctrl+s", "save", "Save"),
+        Binding("ctrl+o", "review", "Review"),
+        Binding("ctrl+f", "find", "Find"),
+        Binding("ctrl+t", "toggle_unset", "Unset keys"),
+        Binding("delete", "remove", "Remove key"),
         Binding("ctrl+r", "reload", "Reload"),
-        Binding("ctrl+u", "toggle_unset", "Show/hide unset"),
-        Binding("ctrl+q", "quit", "Quit"),
+        Binding("escape", "back", "Back to tree", show=False),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, source_path: Path, web_urls: list[str] | None = None):
+    def __init__(self, target: Path, docs: list[str] | None = None, schema: str | None = None):
         super().__init__()
-        self.source_path = source_path
-        self.web_urls = list(web_urls) if web_urls else []
+        self.target = target
+        self.docs = list(docs or [])
+        self.schema = schema
         self.doc: Document | None = None
-        self.index: SchemaIndex | None = None
-        self.current_path: Path_ | None = None
-        self.current_is_ghost = False
-        self.current_default: Any = None
-        self._pattern_section_path: Path_ | None = None
-        self.dirty = False
+        self.index: Index | None = None
+        self.current: Node | None = None  # key shown in the editor
+        self.nodes: dict[KeyPath, TreeNode[Node]] = {}
+        self.unset_children: dict[KeyPath, set[str]] = {}
         self.show_unset = False
+        self.dirty = False
+        self.armed = ""  # action that needs a second press to discard changes
+        self.add_prefix: KeyPath = ()  # section the add form adds to
 
-    # --- Layout --------------------------------------------------------------
+    # --- Layout ----------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="banner")
         with Horizontal(id="main"):
-            yield Tree("config", id="tree-pane")
-            yield VerticalScroll(id="editor-pane")
+            with Vertical(id="tree-pane"):
+                yield Input(placeholder="find key (Esc to close)", id="find")
+                yield Tree[Node]("", id="tree")
+            yield VerticalScroll(id="editor")
         yield Static("", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = f"ezconfig — {self.source_path.name}"
-        self._reload()
+        self.title = f"ezconfig: {self.target.name}"
+        self.load()
 
-    # --- Loading -------------------------------------------------------------
+    # --- Loading ---------------------------------------------------------
 
-    def _reload(self) -> None:
+    @work(thread=True, exclusive=True, group="load")
+    def load(self) -> None:
+        sources = "schema and docs" if self.docs else "schema"
+        self.call_from_thread(self.set_status, f"loading {self.target} (looking up {sources})…")
         try:
-            self.doc = load_doc(self.source_path)
-            self.index = build_index(self.doc, web_urls=self.web_urls)
+            doc = formats.load(self.target) if self.target.exists() else formats.new(self.target)
+            index = build(doc, self.docs, self.schema)
         except Exception as exc:
-            self._set_status(f"load error: {exc}", error=True)
+            self.call_from_thread(self.set_status, f"can't load {self.target}: {exc}", True)
             return
+        self.call_from_thread(self._loaded, doc, index)
 
-        tree = self.query_one(Tree)
-        tree.clear()
-        tree.root.label = self.source_path.name
-        self._populate(tree.root, self.doc.data, ())
-        tree.root.expand()
+    def _loaded(self, doc: Document, index: Index) -> None:
+        self.doc, self.index = doc, index
         self.dirty = False
-        self._update_banner()
-        sources = ", ".join(self.index.sources)
-        ghost_count = len(self.index.ghost_specs)
-        hint = f"  ·  {ghost_count} unset key(s) — press Ctrl+U to view" if ghost_count else ""
-        self._set_status(f"loaded {self.source_path} ({self.doc.format_name}) — schema: {sources}{hint}")
-
-    def _update_banner(self) -> None:
-        """Show a warning banner when the file was loaded via the text fallback."""
+        self.current = None
+        self.query_one("#editor", VerticalScroll).remove_children()
+        notes = list(doc.notes)
+        if not self.target.exists():
+            notes.append("New file: it is created on save.")
         banner = self.query_one("#banner", Static)
-        if self.doc is not None and self.doc.format_name == "text":
-            tokens = getattr(self.doc, "tokens", [])
-            from collections import Counter
-            kinds = Counter(t["kind"] for t in tokens)
-            kind_summary = ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items()))
-            banner.update(
-                f"⚠ Text fallback — {len(tokens)} token(s) by regex ({kind_summary or 'none'}). "
-                f"Detected values are editable; everything else is preserved as-is."
-            )
-            banner.add_class("visible")
-        else:
-            banner.update("")
-            banner.remove_class("visible")
+        banner.update(Text("\n".join(notes)))
+        banner.set_class(bool(notes), "visible")
+        self.rebuild_tree(keep=False)
+        unset = f"{len(index.unset)} unset keys (ctrl+t)" if index.unset else "no unset keys"
+        self.set_status(f"{self.target} ({doc.format_name}): {len(index.specs)} keys, {unset}. " + "; ".join(index.sources))
 
-    def _populate(self, node: TreeNode, data: Any, prefix: Path_) -> None:
-        """Populate one level of the tree at `prefix`. Lazy-expands deeper levels.
+    # --- Tree ------------------------------------------------------------
 
-        Tree nodes carry a tuple in `.data`:
-          ("section", path)       — real section that has children
-          ("leaf",    path)       — real leaf (value in doc)
-          ("ghost-section", path) — section the schema declares but doc doesn't
-          ("ghost-leaf",    path) — schema-declared leaf not in doc
-          ("pattern-add",   path) — '+ Add custom key' action on a pattern section
-        """
-        if not isinstance(data, dict):
-            return
-        idx = self.index
-        children_at_this_level: set[str] = set()
-        # Real keys first.
-        for key, value in data.items():
-            key_s = str(key)
-            children_at_this_level.add(key_s)
-            child_path = prefix + (key_s,)
-            label = self._section_label(key_s, child_path) if isinstance(value, dict) and value else self._leaf_label(key_s, value, ghost=False)
-            if isinstance(value, dict) and value:
-                child = node.add(label, data=("section", child_path), expand=False)
-                # Lazy: only fill section's children when expanded.
-                child.add_leaf("…", data=("placeholder", child_path))
-            else:
-                node.add_leaf(label, data=("leaf", child_path))
-        # Ghost keys (only when show_unset and we have schema data).
-        if self.show_unset and idx is not None:
-            ghost_keys = self._ghost_keys_at(prefix)
-            for key_s in sorted(ghost_keys):
-                if key_s in children_at_this_level:
-                    continue
-                child_path = prefix + (key_s,)
-                if child_path in idx.schema_sections:
-                    label = self._section_label(key_s, child_path, ghost=True)
-                    child = node.add(label, data=("ghost-section", child_path), expand=False)
-                    child.add_leaf("…", data=("placeholder", child_path))
-                else:
-                    spec = idx.ghost_specs.get(child_path, FieldSpec())
-                    label = self._leaf_label(key_s, spec.default, ghost=True,
-                                              deprecated=child_path in idx.deprecated)
-                    node.add_leaf(label, data=("ghost-leaf", child_path))
-        # Pattern-section "+ Add custom key" action.
-        if idx is not None and prefix in idx.pattern_sections:
-            node.add_leaf("+ Add custom key", data=("pattern-add", prefix))
-        # Always offer a manual-add escape hatch at the root. Lets the user
-        # type any key (dotted for nested) + value, regardless of whether
-        # docs/schema discovered it. Useful when the web scraper missed an
-        # option the user knows exists.
-        if prefix == ():
-            node.add_leaf("+ Add custom key (manual)", data=("manual-add", ()))
-
-    def _ghost_keys_at(self, prefix: Path_) -> set[str]:
-        """Top-level schema-declared key names that live directly under `prefix`."""
-        if self.index is None:
-            return set()
-        out: set[str] = set()
-        depth = len(prefix)
-        for path in list(self.index.ghost_specs) + list(self.index.schema_sections):
-            if len(path) > depth and path[:depth] == prefix:
-                out.add(path[depth])
-        return out
-
-    def _expand_lazy(self, node: TreeNode) -> None:
-        """If `node`'s children are still the placeholder, populate for real."""
-        if not node.children:
-            return
-        first = node.children[0]
-        if not first.data or first.data[0] != "placeholder":
-            return
-        node.remove_children()
-        if not self.doc or not node.data:
-            return
-        _, path = node.data
-        # Walk doc to the subdict at this path (may not exist for ghost sections).
-        sub: Any = self.doc.data
-        for part in path:
-            if isinstance(sub, dict) and part in sub:
-                sub = sub[part]
-            else:
-                sub = {}
-                break
-        self._populate(node, sub, path)
-
-    def _section_label(self, key: str, path: Path_, ghost: bool = False) -> str:
-        idx = self.index
-        if idx is None or not self.show_unset:
-            return f"{key}/" + (" (unset)" if ghost else "")
-        set_count, unset_count = self._counts_under(path)
-        if ghost:
-            return f"{key}/  (unset — {unset_count} options)"
-        if unset_count:
-            return f"{key}/  ({set_count} set · {unset_count} unset)"
-        return f"{key}/"
-
-    def _counts_under(self, prefix: Path_) -> tuple[int, int]:
-        """Count real-leaf vs ghost-leaf paths under `prefix` (any depth)."""
-        idx = self.index
-        if idx is None:
-            return (0, 0)
-        d = len(prefix)
-        set_n = sum(1 for p in idx.specs if len(p) > d and p[:d] == prefix)
-        unset_n = sum(1 for p in idx.ghost_specs if len(p) > d and p[:d] == prefix)
-        return set_n, unset_n
-
-    def _leaf_label(self, key: str, value: Any, ghost: bool = False, deprecated: bool = False) -> str:
-        rendered = self._render_value(value)
-        tag = ""
-        if deprecated:
-            tag += "  [DEPRECATED]"
-        if ghost:
-            return f"{key}: {rendered}  (unset){tag}"
-        return f"{key}: {rendered}{tag}"
-
-    def _render_value(self, value: Any) -> str:
-        if isinstance(value, bool):
-            return "on" if value else "off"
-        if isinstance(value, list):
-            return f"[{len(value)} items]"
-        if value is None:
-            return "(no default)"
-        s = str(value)
-        return s if len(s) <= 40 else s[:37] + "…"
-
-    # --- Editor pane ---------------------------------------------------------
-
-    def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
-        """Resolve lazy placeholders the moment a section is expanded."""
-        self._expand_lazy(event.node)
-
-    async def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
-        data = event.node.data
-        if not data:
-            return
-        kind, path = data
-        editor = self.query_one("#editor-pane", VerticalScroll)
-        # Await removal so the new editor-widget id doesn't collide with the
-        # outgoing one (re-selecting the same node otherwise raises DuplicateIds).
-        await editor.remove_children()
-        if kind == "pattern-add":
-            self.current_path = None
-            await editor.mount(Static(f"Pattern section: {'.'.join(path) or '(root)'}", classes="field-label"))
-            await editor.mount(Static(
-                "This section accepts arbitrary keys. Type a name and value, then press Apply.",
-                classes="field-desc",
-            ))
-            await editor.mount(Input(placeholder="key name", id="pattern-key"))
-            await editor.mount(Input(placeholder="value", id="pattern-value"))
-            await editor.mount(Button("Apply", id="pattern-apply", variant="primary"))
-            self._pattern_section_path = path
-            return
-        if kind == "manual-add":
-            self.current_path = None
-            await editor.mount(Static("Add custom key", classes="field-label"))
-            await editor.mount(Static(
-                "Type a key name and value, then press Apply. Use dots for nested "
-                "keys (e.g. 'ui.theme' creates {ui: {theme: ...}}).",
-                classes="field-desc",
-            ))
-            await editor.mount(Input(placeholder="key name (dotted for nested)", id="manual-key"))
-            await editor.mount(Input(placeholder="value", id="manual-value"))
-            await editor.mount(Button("Apply", id="manual-apply", variant="primary"))
-            return
-        if kind not in ("leaf", "ghost-leaf") or self.doc is None or self.index is None:
-            await editor.mount(Static("Select a leaf to edit its value.", classes="placeholder"))
-            self.current_path = None
-            return
-        self.current_path = path
-        self._mount_editor(editor, path, is_ghost=(kind == "ghost-leaf"))
-
-    def _mount_editor(self, container: VerticalScroll, path: Path_, is_ghost: bool = False) -> None:
-        assert self.doc is not None and self.index is not None
-        spec = self.index.get(path)
-        if is_ghost:
-            value = spec.default  # may be None — widgets handle that
-            self.current_default = spec.default
-        else:
+    def _container(self, path: KeyPath) -> Any:
+        assert self.doc is not None
+        try:
             value = self.doc.get(path)
-            self.current_default = None  # not a ghost; promotion gating doesn't apply
-        self.current_is_ghost = is_ghost
+        except (KeyError, IndexError, ValueError, TypeError):
+            return None
+        return value if is_container(value) else None
 
-        suffix = "  (unset — editing default)" if is_ghost else ""
-        container.mount(Label(".".join(path) + suffix, classes="field-label"))
-        if path in self.index.deprecated:
-            container.mount(Static("⚠ Deprecated.", classes="field-warning"))
+    def rebuild_tree(self, keep: bool = True) -> None:
+        if self.doc is None or self.index is None:
+            return
+        tree = self.query_one("#tree", Tree)
+        expanded = [p for p, n in self.nodes.items() if n.is_expanded] if keep else []
+        cursor = tree.cursor_node.data.path if keep and tree.cursor_node and tree.cursor_node.data else None
+        self.unset_children = {}
+        for path in [*self.index.unset, *self.index.sections]:
+            for i in range(len(path)):
+                self.unset_children.setdefault(path[:i], set()).add(path[i])
+        tree.clear()
+        self.nodes = {}
+        tree.root.set_label(Text(self.target.name, style="bold"))
+        tree.root.data = Node("section", ())
+        find = self.query_one("#find", Input)
+        if find.has_class("visible") and find.value.strip():
+            self._fill_matches(tree.root, find.value.strip().lower())
+        else:
+            self._fill(tree.root, ())
+        tree.root.expand()
+        for path in sorted(expanded, key=len):
+            if node := self.nodes.get(path):
+                self._expand(node)
+        if cursor and (node := self.nodes.get(cursor)):
+            tree.move_cursor(node)
+
+    def _fill(self, node: TreeNode[Node], prefix: KeyPath) -> None:
+        assert self.doc is not None and self.index is not None
+        container = self._container(prefix)
+        present: set[str] = set()
+        for key, value in items(container) if container is not None else ():
+            path = prefix + (key,)
+            present.add(key)
+            if is_container(value):
+                self.nodes[path] = child = node.add(self._section_label(key, path, unset=False), Node("section", path))
+                child.add_leaf("…", Node("more", path))
+            else:
+                self.nodes[path] = node.add_leaf(self._key_label(key, path, value), Node("key", path))
+        if self.show_unset:
+            for key in sorted(self.unset_children.get(prefix, set()) - present):
+                path = prefix + (key,)
+                if path in self.index.unset and path not in self.unset_children:
+                    spec = self.index.unset[path]
+                    self.nodes[path] = node.add_leaf(self._key_label(key, path, spec.default, unset=True), Node("unset-key", path))
+                else:
+                    self.nodes[path] = child = node.add(self._section_label(key, path, unset=True), Node("unset-section", path))
+                    child.add_leaf("…", Node("more", path))
+        if self.doc.can_add and (container is None or isinstance(container, dict)):
+            node.add_leaf(Text("+ Add key", style="italic dim"), Node("add", prefix))
+
+    def _fill_matches(self, root: TreeNode[Node], query: str) -> None:
+        assert self.doc is not None and self.index is not None
+        paths = [(p, "key") for p in self.index.specs] + [(p, "unset-key") for p in self.index.unset]
+        shown = 0
+        for path, kind in sorted(paths):
+            if query not in dotted(path).lower():
+                continue
+            value = self.doc.get(path) if kind == "key" else self.index.unset[path].default
+            self.nodes[path] = root.add_leaf(self._key_label(dotted(path), path, value, unset=kind == "unset-key"), Node(kind, path))
+            shown += 1
+            if shown >= MAX_MATCHES:
+                root.add_leaf(Text(f"(first {MAX_MATCHES} matches)", style="dim"), Node("more", ()))
+                break
+
+    def _fill_lazy(self, node: TreeNode[Node]) -> None:
+        """Replace a section's "…" placeholder with its children."""
+        children = list(node.children)
+        if children and children[0].data and children[0].data.kind == "more" and node.data:
+            node.remove_children()
+            self._fill(node, node.data.path)
+
+    def _expand(self, node: TreeNode[Node]) -> None:
+        self._fill_lazy(node)
+        node.expand()
+
+    def _section_label(self, key: str, path: KeyPath, unset: bool) -> Text:
+        text = Text(f"{key}/", style="dim italic" if unset else "")
+        if self.show_unset and self.index is not None:
+            below = sum(1 for p in self.index.unset if p[: len(path)] == path)
+            if below:
+                text.append(f"  {below} unset", style="dim")
+        return text
+
+    def _key_label(self, key: str, path: KeyPath, value: Any, unset: bool = False) -> Text:
+        spec = self.index.get(path) if self.index else FieldSpec()
+        text = Text(f"{key}: ", style="dim italic" if unset else "")
+        if isinstance(value, str) and COLOR_RE.match(value):
+            text.append("■ ", style=self._swatch_style(value))
+        text.append(show_value(value) if value is not None else "(no default)", style="dim italic" if unset else "")
+        if spec.deprecated:
+            text.append("  deprecated", style="red")
+        return text
+
+    @staticmethod
+    def _swatch_style(value: str) -> str:
+        digits = value[1:] if value.startswith("#") else value[2:]
+        if len(digits) == 3:
+            digits = "".join(c * 2 for c in digits)
+        return f"#{digits[:6]}"
+
+    def on_tree_node_expanded(self, event: Tree.NodeExpanded[Node]) -> None:
+        self._fill_lazy(event.node)
+
+    def refresh_label(self, path: KeyPath) -> None:
+        node = self.nodes.get(path)
+        if node is not None and self.doc is not None and node.data and node.data.kind == "key":
+            key = dotted(path) if self.query_one("#find", Input).has_class("visible") else path[-1]
+            node.set_label(self._key_label(key, path, self.doc.get(path)))
+
+    # --- Editor ----------------------------------------------------------
+
+    async def on_tree_node_selected(self, event: Tree.NodeSelected[Node]) -> None:
+        if event.node.data is not None:
+            await self.show_editor(event.node.data)
+
+    async def show_editor(self, node: Node) -> None:
+        pane = self.query_one("#editor", VerticalScroll)
+        await pane.remove_children()
+        if self.doc is None or self.index is None:
+            return
+        self.current = None
+        if node.kind == "add":
+            self.add_prefix = node.path
+            await pane.mount_all(self._add_form(node.path))
+            self._focus_editor()
+            return
+        if node.kind not in ("key", "unset-key"):
+            await pane.mount(Static("Select a key to edit it.", classes="muted"))
+            return
+        self.current = node
+        spec = self.index.get(node.path)
+        unset = node.kind == "unset-key"
+        value = spec.default if unset else self.doc.get(node.path)
+        parts: list[Any] = [Label(Text(dotted(node.path) + ("  (unset)" if unset else "")), classes="path")]
+        if spec.deprecated:
+            parts.append(Static(Text(f"Deprecated: {spec.deprecated}"), classes="warn"))
         if spec.description:
-            container.mount(Static(spec.description, classes="field-desc"))
-
-        widget = self._make_widget(spec, value)
-        container.mount(widget)
-
-        # Non-authoritative dropdowns (web scraping / key-name heuristics) may
-        # miss values the docs don't enumerate explicitly — let the user type
-        # one anyway. `spec.warning` is set on exactly these sources, so it's
-        # the right gate. Schema-driven enums never get this escape hatch.
-        if spec.widget == "select" and spec.warning:
-            container.mount(Static("Value not in the list? Type a custom value:", classes="field-meta"))
-            initial = "" if (value is None or value in (spec.enum or [])) else str(value)
-            container.mount(Input(value=initial, placeholder="custom value", id="custom-value"))
-
-        meta_bits = [f"widget: {spec.widget}", f"source: {spec.source}"]
-        if spec.enum:
-            meta_bits.append(f"options: {len(spec.enum)}")
+            parts.append(Static(Text(spec.description), classes="desc"))
+        parts.append(self._editor_widget(spec, value))
+        meta = [f"source: {spec.source}"]
+        if spec.options:
+            meta.append(f"{len(spec.options)} options" + ("" if spec.strict else ", other values allowed"))
         if spec.minimum is not None or spec.maximum is not None:
-            meta_bits.append(f"range: {spec.minimum}..{spec.maximum}")
+            meta.append(f"range: {spec.minimum if spec.minimum is not None else ''}..{spec.maximum if spec.maximum is not None else ''}")
         if spec.default is not None:
-            meta_bits.append(f"default: {spec.default!r}")
-        container.mount(Static(" · ".join(meta_bits), classes="field-meta"))
+            meta.append(f"default: {option_label(spec.default)}")
+        parts.append(Static(Text(" · ".join(meta)), classes="muted"))
         if spec.warning:
-            container.mount(Static(f"⚠ {spec.warning}", classes="field-warning"))
-        if is_ghost:
-            container.mount(Static(
-                "Ghost key: change the value to anything other than the default to add it to the file.",
-                classes="field-meta",
-            ))
+            parts.append(Static(Text(spec.warning), classes="warn"))
+        if unset:
+            parts.append(Static("Unset key: a value other than the default adds it to the file.", classes="muted"))
+        await pane.mount_all(parts)
+        self._focus_editor()
 
-    def _make_widget(self, spec: FieldSpec, value: Any):
-        widget = spec.widget
-        if widget == "switch":
-            return Switch(value=bool(value), id="editor-widget")
-        if widget == "color":
-            return HexColorPicker(value=str(value) if value else "#000000", id="editor-widget")
-        if widget == "select" and spec.enum:
-            options = [(str(o), o) for o in spec.enum]
-            return Select(options=options, value=value if value in spec.enum else Select.NULL, id="editor-widget")
-        if widget == "number":
-            return Input(value=str(value) if value is not None else "", type="number", id="editor-widget")
-        if widget == "list":
-            return ListEditor(
-                items=value or [],
-                item_type=spec.item_type,
-                item_enum=spec.item_enum,
-                id="editor-widget",
-            )
-        return Input(value="" if value is None else str(value), id="editor-widget")
+    def _focus_editor(self) -> None:
+        pane = self.query_one("#editor", VerticalScroll)
+        target = next((w for w in pane.query("*") if w.focusable), None)
+        if target is not None:
+            target.focus()
 
-    # --- Change handlers (each writes back to the doc) -----------------------
+    def _editor_widget(self, spec: FieldSpec, value: Any) -> Any:
+        kind = spec.widget
+        if kind == "switch":
+            return Switch(value=bool(value), id="editor-input")
+        if kind == "color":
+            shown = "#" + value[2:] if isinstance(value, str) and value.startswith("0x") else value
+            return ColorPicker(value=str(shown) if shown else "#000000", id="editor-input")
+        if kind == "choice" and spec.options:
+            return ChoiceEditor(spec.options, value, strict=spec.strict, notes=spec.option_notes, id="editor-input")
+        if kind == "number":
+            return Input(value="" if value is None else str(value), type="integer" if spec.integer else "number", id="editor-input")
+        if kind == "list":
+            return ListEditor(value if isinstance(value, list) else [], spec.item_type, spec.item_options, id="editor-input")
+        if kind == "readonly":
+            return Static(Text(json.dumps(value, indent=2, default=str) + "\n\nThis value can't be edited here."), classes="muted")
+        return Input(value="" if value is None else str(value), id="editor-input")
+
+    def _add_form(self, prefix: KeyPath) -> list[Any]:
+        assert self.index is not None
+        n = len(prefix)
+        known = sorted(".".join(p[n:]) for p in self.index.unset if p[:n] == prefix)
+        where = dotted(prefix)
+        hint = "Use dots for nested keys, e.g. ui.theme." if self.doc and self.doc.format_name != "text" else ""
+        return [
+            Label(f"Add key in {where}", classes="path"),
+            Static(f"Values are typed: true, 42, 1.5; quote to force text. {hint}", classes="desc"),
+            Input(placeholder="key", id="add-key", suggester=SuggestFromList(known, case_sensitive=False) if known else None),
+            Input(placeholder="value", id="add-value"),
+            Button("Add", id="add-apply", variant="primary"),
+        ]
+
+    # --- Edits -----------------------------------------------------------
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
-        if self.current_path is None or self.doc is None:
-            return
-        self._commit(self.current_path, event.value)
+        if event.switch.id == "editor-input":
+            self.commit(event.value)
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if self.current_path is None or self.doc is None or event.value is Select.NULL:
-            return
-        self._commit(self.current_path, event.value)
+    def on_choice_editor_changed(self, event: ChoiceEditor.Changed) -> None:
+        self.commit(event.value)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if self.current_path is None or self.doc is None or self.index is None:
-            return
-        # Custom-value override for non-authoritative dropdowns: free-form
-        # string commit, no type coercion (the field is text-typed by
-        # construction — see _mount_editor's gate).
-        if event.input.id == "custom-value":
-            self._commit(self.current_path, event.value)
-            return
-        # Only handle the top-level editor Input. HexColorPicker / ListEditor
-        # consume their own internal Input events and emit their own Changed.
-        if event.input.id != "editor-widget":
-            return
-        spec = self.index.get(self.current_path)
-        raw = event.value
-        if spec.widget == "number":
-            try:
-                new_val = int(raw) if spec.is_integer else float(raw)
-            except ValueError:
+    def on_color_picker_changed(self, event: ColorPicker.Changed) -> None:
+        if self.current and self.doc and self.current.kind == "key":
+            old = self.doc.get(self.current.path)
+            if isinstance(old, str) and old.startswith("0x"):
+                self.commit("0x" + event.value[1:])
                 return
-            self._commit(self.current_path, new_val)
-        else:
-            self._commit(self.current_path, raw)
-
-    def on_hex_color_picker_changed(self, event: HexColorPicker.Changed) -> None:
-        if self.current_path is None or self.doc is None:
-            return
-        self._commit(self.current_path, event.value)
+        self.commit(event.value)
 
     def on_list_editor_changed(self, event: ListEditor.Changed) -> None:
-        if self.current_path is None or self.doc is None:
-            return
-        self._commit(self.current_path, event.items)
+        self.commit(event.items)
 
-    def _commit(self, path: Path_, value: Any) -> None:
-        assert self.doc is not None and self.index is not None
-        # Ghost promotion rule: only write to the doc when the value differs
-        # from the schema default. This protects against accidentally adding a
-        # key the user only browsed past.
-        if self.current_is_ghost and path == self.current_path:
-            if value == self.current_default:
-                self._set_status("ghost unchanged — value matches default, not writing")
-                return
-            created = self.doc.add_path(path, value)
-            self.current_is_ghost = False
-            # Move the spec from ghost to real so meta says 'set' not 'unset'.
-            if path in self.index.ghost_specs:
-                self.index.specs[path] = self.index.ghost_specs.pop(path)
-            created_msg = ""
-            if created:
-                created_msg = "  ·  created: " + ", ".join(".".join(p) for p in created)
-            self.dirty = True
-            self._refresh_tree_full()
-            self._set_status(f"added {'.'.join(path)} = {value!r}{created_msg}")
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "find":
+            self.rebuild_tree(keep=False)
             return
-        self.doc.set(path, value)
+        if event.input.id != "editor-input" or self.current is None or self.index is None:
+            return
+        spec = self.index.get(self.current.path)
+        if spec.widget != "number":
+            self.commit(event.value)
+            return
+        try:
+            number = int(event.value) if spec.integer else float(event.value)
+        except ValueError:
+            return
+        if (spec.minimum is not None and number < spec.minimum) or (spec.maximum is not None and number > spec.maximum):
+            self.set_status(f"{number} is out of range {spec.minimum}..{spec.maximum}; not applied", True)
+            return
+        self.commit(number)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "find":
+            tree = self.query_one("#tree", Tree)
+            tree.focus()
+            first = next((n for n in tree.root.children if n.data and n.data.kind in ("key", "unset-key")), None)
+            if first is not None:
+                tree.select_node(first)
+        elif event.input.id in ("add-key", "add-value"):
+            self.add_key()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "add-apply":
+            self.add_key()
+
+    def commit(self, value: Any) -> None:
+        if self.current is None or self.doc is None or self.index is None:
+            return
+        path = self.current.path
+        self.armed = ""
+        try:
+            if self.current.kind == "unset-key":
+                if value == self.index.get(path).default:
+                    self.set_status(f"{dotted(path)}: same as the default, not added")
+                    return
+                created = self.doc.add(path, value)
+                self.index.mark_set(path)
+                self.current = Node("key", path)
+                self.dirty = True
+                self.rebuild_tree()
+                extra = f" (created {', '.join(dotted(p) for p in created)})" if created else ""
+                self.set_status(f"added {dotted(path)} = {option_label(value)}{extra}; unsaved")
+                return
+            self.doc.set(path, value)
+        except Exception as exc:
+            self.set_status(f"can't set {dotted(path)}: {exc}", True)
+            return
         self.dirty = True
-        self._refresh_tree_label(path)
-        self._set_status(f"edited {'.'.join(path)} — unsaved changes")
+        self.refresh_label(path)
+        self.set_status(f"{dotted(path)} = {show_value(value, 60)}; unsaved")
 
-    def _refresh_tree_full(self) -> None:
-        """Rebuild the entire tree — used after structural changes (add key,
-        toggle unset). Cheaper than tracking individual node changes for now."""
-        if self.doc is None:
+    def add_key(self) -> None:
+        if self.doc is None or self.index is None:
             return
-        tree = self.query_one(Tree)
-        tree.clear()
-        tree.root.label = self.source_path.name
-        self._populate(tree.root, self.doc.data, ())
-        tree.root.expand()
+        tree = self.query_one("#tree", Tree)
+        prefix = self.add_prefix
+        name = self.query_one("#add-key", Input).value.strip()
+        raw = self.query_one("#add-value", Input).value
+        rel = tuple(p for p in name.split(".") if p) if self.doc.format_name != "text" else (name,)
+        if not name or not rel:
+            self.set_status("add: the key name is empty", True)
+            return
+        path = prefix + rel
+        if self.doc.has(path):
+            self.set_status(f"add: {dotted(path)} already exists", True)
+            return
+        spec = self.index.unset.get(path)
+        value = raw if spec and spec.widget in ("text", "choice") and not raw.strip().startswith(('"', "'")) else parse_literal(raw)
+        try:
+            created = self.doc.add(path, value)
+        except Exception as exc:
+            self.set_status(f"add: {exc}", True)
+            return
+        self.index.mark_set(path)
+        self.index.specs.setdefault(path, infer(value))
+        self.dirty = True
+        self.rebuild_tree()
+        extra = f" (created {', '.join(dotted(p) for p in created)})" if created else ""
+        self.set_status(f"added {dotted(path)} = {option_label(value)}{extra}; unsaved")
+        if target := self.nodes.get(path):
+            tree.move_cursor(target)
 
-    def _refresh_tree_label(self, path: Path_) -> None:
-        tree = self.query_one(Tree)
-        node = tree.root
-        for part in path[:-1]:
-            match = next((c for c in node.children if c.data and c.data[1] == path[: len(c.data[1])]), None)
-            if match is None:
-                return
-            node = match
-        for child in node.children:
-            if child.data and child.data[1] == path:
-                child.set_label(self._leaf_label(path[-1], self.doc.get(path)))
-                return
-
-    # --- Actions -------------------------------------------------------------
+    # --- Actions ---------------------------------------------------------
 
     def action_save(self) -> None:
         if self.doc is None:
             return
         try:
-            backup = self.doc.save()
-            self.dirty = False
-            if backup:
-                self._set_status(f"saved {self.source_path}  ·  backup: {backup}")
-            else:
-                self._set_status(f"saved {self.source_path}  ·  no prior file to back up")
+            copy = self.doc.save()
         except Exception as exc:
-            self._set_status(f"save failed: {exc}", error=True)
-
-    def action_reload(self) -> None:
-        self._reload()
-
-    def action_toggle_unset(self) -> None:
-        """Ctrl+U — show or hide schema-declared keys that aren't in the file."""
-        if self.index is None or not self.index.ghost_specs:
-            self._set_status("no schema-declared unset keys for this file")
+            self.set_status(f"save failed: {exc}", True)
             return
-        self.show_unset = not self.show_unset
-        self._refresh_tree_full()
-        state = "ON" if self.show_unset else "OFF"
-        n = len(self.index.ghost_specs)
-        skipped = self.index.skipped_conditionals
-        skip_note = f"  ({skipped} conditional branches skipped)" if skipped else ""
-        self._set_status(f"show unset: {state}  ·  {n} ghost keys{skip_note}")
+        self.dirty = False
+        self.armed = ""
+        self.query_one("#banner", Static).set_class(bool(self.doc.notes), "visible")
+        self.set_status(f"saved {self.target}" + (f"; backup: {copy}" if copy else ""))
+        if self.index and self.index.schemas:
+            self.check_after_save()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    @work(thread=True, exclusive=True, group="check")
+    def check_after_save(self) -> None:
+        problems = self._problems()
+        if problems:
+            self.call_from_thread(self.set_status, f"saved {self.target}; {len(problems)} schema problems (ctrl+o to review)", True)
+
+    def _problems(self) -> list[str]:
+        if self.doc is None or self.index is None:
+            return []
+        data = self.doc.plain()
+        out: list[str] = []
+        for s in self.index.schemas:
+            for line in schema_mod.validate(data, s):
+                if line not in out:
+                    out.append(line)
+        return out
+
+    @work(thread=True, exclusive=True, group="check")
+    def action_review(self) -> None:
         if self.doc is None:
             return
-        if event.button.id == "manual-apply":
-            key_input = self.query_one("#manual-key", Input).value.strip()
-            val_input = self.query_one("#manual-value", Input).value
-            if not key_input:
-                self._set_status("custom key: name is empty", error=True)
-                return
-            new_path = tuple(part for part in key_input.split(".") if part)
-            if not new_path:
-                self._set_status("custom key: name is empty", error=True)
-                return
-            self._apply_custom_add(new_path, val_input)
-            event.stop()
-            return
-        if event.button.id != "pattern-apply" or self._pattern_section_path is None:
-            return
-        key_input = self.query_one("#pattern-key", Input).value.strip()
-        val_input = self.query_one("#pattern-value", Input).value
-        if not key_input:
-            self._set_status("custom key: name is empty", error=True)
-            return
-        new_path = self._pattern_section_path + (key_input,)
-        self._apply_custom_add(new_path, val_input)
-        event.stop()
+        before = self.doc.original_text.splitlines(keepends=True)
+        after = self.doc.dumps().splitlines(keepends=True)
+        diff = "".join(difflib.unified_diff(before, after, "on disk", "unsaved"))
+        problems = self._problems() if self.index and self.index.schemas else ["No schema for this file."]
+        self.call_from_thread(self.push_screen, ReviewScreen(diff, problems))
 
-    def _apply_custom_add(self, new_path: Path_, val_input: str) -> None:
-        assert self.doc is not None
+    def action_find(self) -> None:
+        find = self.query_one("#find", Input)
+        find.add_class("visible")
+        find.focus()
+
+    def action_back(self) -> None:
+        """Esc: close find, or move focus from the editor back to the tree."""
+        find = self.query_one("#find", Input)
+        if find.has_class("visible"):
+            find.value = ""
+            find.remove_class("visible")
+            self.rebuild_tree(keep=False)
+        self.query_one("#tree", Tree).focus()
+
+    def action_toggle_unset(self) -> None:
+        if self.index is None:
+            return
+        if not self.index.unset and not self.show_unset:
+            self.set_status("no unset keys: no schema or docs list keys missing from this file")
+            return
+        self.show_unset = not self.show_unset
+        self.rebuild_tree()
+        skipped = f"; {self.index.skipped} branching schema sections not listed" if self.index.skipped else ""
+        state = "shown" if self.show_unset else "hidden"
+        self.set_status(f"unset keys {state}: {len(self.index.unset)}{skipped}")
+
+    def action_remove(self) -> None:
+        if self.doc is None or self.index is None:
+            return
+        node = self.query_one("#tree", Tree).cursor_node
+        if node is None or node.data is None or node.data.kind not in ("key", "section") or not node.data.path:
+            self.set_status("select a key or section in the tree to remove it")
+            return
+        path = node.data.path
         try:
-            created = self.doc.add_path(new_path, val_input)
+            self.doc.delete(path)
         except Exception as exc:
-            self._set_status(f"add failed: {exc}", error=True)
+            self.set_status(f"can't remove {dotted(path)}: {exc}", True)
             return
+        for p in [p for p in self.index.specs if p[: len(path)] == path]:
+            self.index.mark_unset(p)
         self.dirty = True
-        self._refresh_tree_full()
-        msg = f"added custom key {'.'.join(new_path)} = {val_input!r}"
-        if created:
-            msg += "  ·  created: " + ", ".join(".".join(p) for p in created)
-        self._set_status(msg)
+        self.rebuild_tree()
+        if self.current and self.current.path[: len(path)] == path:
+            self.query_one("#editor", VerticalScroll).remove_children()
+            self.current = None
+        self.set_status(f"removed {dotted(path)}; unsaved (ctrl+o to review, ctrl+r to discard)")
 
-    def _set_status(self, msg: str, error: bool = False) -> None:
-        bar = self.query_one("#status", Static)
-        bar.update(msg)
-        bar.styles.color = "red" if error else "white"
+    def _confirm_discard(self, action: str, verb: str) -> bool:
+        if not self.dirty or self.armed == action:
+            return True
+        self.armed = action
+        self.set_status(f"unsaved changes: ctrl+s saves, {verb} again discards them", True)
+        return False
+
+    def action_reload(self) -> None:
+        if self._confirm_discard("reload", "ctrl+r"):
+            self.armed = ""
+            self.load()
+
+    async def action_quit(self) -> None:
+        if self._confirm_discard("quit", "ctrl+q"):
+            self.exit()
+
+    def set_status(self, message: str, error: bool = False) -> None:
+        status = self.query_one("#status", Static)
+        status.update(Text(message))
+        status.set_class(error, "error")
 
 
-def run(source_path: Path, web_urls: list[str] | None = None) -> None:
-    EzConfigApp(source_path, web_urls=web_urls).run()
+def run(target: Path, docs: list[str] | None = None, schema: str | None = None) -> None:
+    EzConfigApp(target, docs=docs, schema=schema).run()
